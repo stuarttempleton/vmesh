@@ -61,7 +61,13 @@ python vmesh.py --host 192.168.1.100
 With a feature plugin:
 
 ```bash
-python vmesh.py --port /dev/ttyUSB0 --feature features/llm.py
+python vmesh.py --port /dev/ttyUSB0 --feature features/trout.py
+```
+
+Or with all feature plugins:
+
+```bash
+python vmesh.py --port /dev/ttyUSB0 --features all
 ```
 
 You can pass `--feature` more than once.
@@ -70,6 +76,7 @@ You can pass `--feature` more than once.
 
 - `/send your message`
 - `/sendto "Node Name" your message`
+- `/feature load|unload|reload PATH`
 - `/nodes`
 - `/info`
 - `/help`
