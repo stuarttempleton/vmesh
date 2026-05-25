@@ -54,17 +54,32 @@ class PendingAck:
     message: str
     timestamp: datetime
     status: str = "pending"  # "ack" | "nack" | "pending"
+
+
+@dataclass(frozen=True)
+class CommandSpec:
+    aliases: tuple[str, ...]
+    usage: str
+    description: str
+    handler: Callable[[str], bool | None]
  
 
 class NodeSuggester(Suggester):
-    def __init__(self, iface):
+    def __init__(self, iface, sendto_aliases: set[str]):
         super().__init__()
         self.iface = iface
+        self.sendto_aliases = {a.lower() for a in sendto_aliases}
 
     async def get_suggestion(self, value: str) -> str | None:
-        if not value.startswith("/sendto "):
+        if not value.startswith("/"):
             return None
-        partial = value[len("/sendto "):].lstrip('"').lower()
+
+        cmd, sep, remainder = value[1:].partition(" ")
+        cmd = cmd.lower()
+        if cmd not in self.sendto_aliases or not sep:
+            return None
+
+        partial = remainder.lstrip('"').lower()
         for node_id, node in (self.iface.nodes or {}).items():
             user = node.get("user", {})
             candidates = [
@@ -75,7 +90,7 @@ class NodeSuggester(Suggester):
             for name in candidates:
                 if name.lower().startswith(partial):
                     dest = f'"{name}"' if " " in name else name
-                    return f"/sendto {dest} "
+                    return f"/{cmd} {dest} "
         return None
 
 # -- App ---------------------------------------------------------------------
@@ -111,16 +126,7 @@ class MeshChatApp(App):
     }
     """
     
-    CORE_HELP = [
-        "Commands:",
-        "  /send MSG               - send a message to the mesh",
-        "  /sendto NODE_ID MSG     - send a message to a specific node",
-        "  /nodes                  - show nodes in the mesh",
-        "  /info                   - show info about this node",
-        "  /quit                   - exit the app",
-        "",
-        "  Tip: to copy text, use Shift+drag in a standard terminal",
-    ]
+    CORE_HELP_TIP = "  Tip: to copy text, use Shift+drag in a standard terminal"
 
     def __init__(self, port: str = None, host: str = None, feature_paths: list[str] = None):
         super().__init__()
@@ -129,6 +135,9 @@ class MeshChatApp(App):
         self.bus      = MeshEventBus()
         self.features: list = []
         self._commands: dict[str, Callable] = {}
+        self._core_specs: list[CommandSpec] = []
+        self._core_commands: dict[str, CommandSpec] = {}
+        self._sendto_aliases: set[str] = {"sendto"}
         self._node_cache: dict[str, dict] = {}
         self._ack_log: dict[int, PendingAck] = {}
 
@@ -140,11 +149,64 @@ class MeshChatApp(App):
 
         # Load features after iface exists but ui_write isn't ready yet —
         # features that call ui_write at init time will queue via call_from_thread.
+        self._register_core_commands()
         for path in (feature_paths or []):
             feature = self.load_feature(path)
             if feature:
                 self.features.append(feature)
                 self._commands.update(feature.commands())
+
+    def _register_core_commands(self) -> None:
+        self._core_specs = [
+            CommandSpec(
+                aliases=("send",),
+                usage="/send MSG",
+                description="send a message to the mesh",
+                handler=self._cmd_send,
+            ),
+            CommandSpec(
+                aliases=("sendto","msg", "w"),
+                usage='/sendto "NODE" MSG',
+                description="send a message to a specific node",
+                handler=lambda args: self._cmd_sendto(f"/sendto {args}"),
+            ),
+            CommandSpec(
+                aliases=("nodes", "nodelist"),
+                usage="/nodes",
+                description="show nodes in the mesh",
+                handler=lambda _args: self._cmd_nodes(),
+            ),
+            CommandSpec(
+                aliases=("info", "nodeinfo", "nodeInfo"),
+                usage="/info",
+                description="show info about this node",
+                handler=lambda _args: self._cmd_info(),
+            ),
+            CommandSpec(
+                aliases=("help", "h"),
+                usage="/help",
+                description="show command help",
+                handler=lambda _args: self._cmd_help(),
+            ),
+            CommandSpec(
+                aliases=("q", "quit", "exit"),
+                usage="/quit",
+                description="exit the app",
+                handler=lambda _args: self._cmd_quit(),
+            ),
+        ]
+
+        self._core_commands = {}
+        for spec in self._core_specs:
+            for alias in spec.aliases:
+                self._core_commands[alias] = spec
+
+        self._sendto_aliases = {
+            alias
+            for spec in self._core_specs
+            if "sendto" in spec.aliases
+            for alias in spec.aliases
+        } or {"sendto"}
 
     def load_feature(self, path: str):
         """
@@ -205,7 +267,7 @@ class MeshChatApp(App):
         yield Input(
             placeholder="Type /help for commands", 
             max_length=180,
-            suggester=NodeSuggester(self.iface),)
+            suggester=NodeSuggester(self.iface, self._sendto_aliases),)
         
         yield Horizontal(
             Label("", id="status"),
@@ -249,7 +311,16 @@ class MeshChatApp(App):
         return datetime.now().strftime("[%H:%M]")
 
     def _build_help(self) -> str:
-        lines = list(self.CORE_HELP)
+        lines = ["Commands:"]
+        for spec in self._core_specs:
+            alias_text = ""
+            if len(spec.aliases) > 1:
+                alias_text = f" (aliases: {', '.join('/' + a for a in spec.aliases[1:])})"
+            lines.append(f"  {spec.usage:24s} - {spec.description}{alias_text}")
+
+        lines.append("")
+        lines.append(self.CORE_HELP_TIP)
+
         for feature in self.features:
             extra = feature.help_text()
             if extra:
@@ -351,52 +422,23 @@ class MeshChatApp(App):
             event.input.value = ""
 
     def _dispatch_input(self, text: str) -> bool:
-        if text == "/send":
-            self.ui_system_write("Usage: /send <message>")
-            return False
-
-        if text.startswith("/send "):
-            return self._safe_execute(
-                lambda: self._cmd_send(text[len("/send "):]),
-                "send",
-            )
-
-        if text == "/sendto":
-            self.ui_system_write('Usage: /sendto "<node name or id>" <message>')
-            return False
-
-        elif text.startswith("/sendto "):
-            return self._safe_execute(lambda: self._cmd_sendto(text), "sendto")
-
-        elif text in ("/nodes", "/nodelist"):
-            self.ui_system_write(format_nodes(self.iface), log=True)
-            return True
-
-        elif text in ("/info", "/nodeinfo", "/nodeInfo"):
-            self.ui_system_write(format_node_info(self.iface), log=True)
-            return True
-
-        elif text in ("/help", "/h"):
-            self.ui_system_write(self._build_help(), log=True)
-            return True
-
-        elif text in ("/q", "/quit", "/exit"):
-            self.exit()
-            return True
-
-        elif text.startswith("/"):
-            # Dispatch to feature commands
-            cmd, _, args = text[1:].partition(" ")
-            if cmd in self._commands:
-                return self._safe_execute(lambda: self._commands[cmd](args), f"/{cmd}")
-            else:
-                self.ui_write(f"[red]Unknown command:[/] /{cmd}")
-                return False
-        
-        else:
+        if not text.startswith("/"):
             self.ui_system_write(f"Unknown command: {text}", log=True)
             self.ui_system_write(self._build_help(), log=True)
             return False
+
+        cmd, _, args = text[1:].partition(" ")
+        args = args.strip()
+
+        core_spec = self._core_commands.get(cmd)
+        if core_spec:
+            return self._safe_execute(lambda: core_spec.handler(args), f"/{cmd}")
+
+        if cmd in self._commands:
+            return self._safe_execute(lambda: self._commands[cmd](args), f"/{cmd}")
+
+        self.ui_write(f"[red]Unknown command:[/] /{cmd}")
+        return False
 
     def _safe_execute(self, fn: Callable[[], bool | None], command_name: str) -> bool:
         """Execute a command handler and surface errors without crashing input handling."""
@@ -423,6 +465,22 @@ class MeshChatApp(App):
 
         self.ui_write(f"[bold cyan]You:[/] {msg}", log=True)
         self.bus.fire("on_send", BROADCAST_ADDR, msg)
+        return True
+
+    def _cmd_nodes(self) -> bool:
+        self.ui_system_write(format_nodes(self.iface), log=True)
+        return True
+
+    def _cmd_info(self) -> bool:
+        self.ui_system_write(format_node_info(self.iface), log=True)
+        return True
+
+    def _cmd_help(self) -> bool:
+        self.ui_system_write(self._build_help(), log=True)
+        return True
+
+    def _cmd_quit(self) -> bool:
+        self.exit()
         return True
 
     def _cmd_sendto(self, text: str) -> bool:
