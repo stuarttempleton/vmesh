@@ -67,10 +67,10 @@ class CommandSpec:
  
 
 class NodeSuggester(Suggester):
-    def __init__(self, iface, sendto_aliases: set[str]):
+    def __init__(self, iface, node_target_commands: set[str]):
         super().__init__()
         self.iface = iface
-        self.sendto_aliases = {a.lower() for a in sendto_aliases}
+        self.node_target_commands = {a.lower() for a in node_target_commands}
 
     async def get_suggestion(self, value: str) -> str | None:
         if not value.startswith("/"):
@@ -78,7 +78,7 @@ class NodeSuggester(Suggester):
 
         cmd, sep, remainder = value[1:].partition(" ")
         cmd = cmd.lower()
-        if cmd not in self.sendto_aliases or not sep:
+        if cmd not in self.node_target_commands or not sep:
             return None
 
         partial = remainder.lstrip('"').lower()
@@ -140,10 +140,12 @@ class MeshChatApp(App):
         self._core_specs: list[CommandSpec] = []
         self._core_commands: dict[str, CommandSpec] = {}
         self._sendto_aliases: set[str] = {"sendto"}
+        self._node_target_commands: set[str] = {"sendto"}
         self._feature_path_set: set[str] = set()
         self._feature_paths_loaded: list[str] = []
         self._feature_by_path: dict[str, object] = {}
         self._feature_command_map: dict[object, dict[str, Callable]] = {}
+        self._feature_completion_map: dict[object, dict[str, str]] = {}
         self._node_cache: dict[str, dict] = {}
         self._ack_log: dict[int, PendingAck] = {}
 
@@ -216,6 +218,15 @@ class MeshChatApp(App):
             if "sendto" in spec.aliases
             for alias in spec.aliases
         } or {"sendto"}
+        self._node_target_commands = set(self._sendto_aliases)
+
+    def _rebuild_completion_sets(self) -> None:
+        commands = set(self._sendto_aliases)
+        for completion_map in self._feature_completion_map.values():
+            for cmd_name, kind in completion_map.items():
+                if kind == "node_target":
+                    commands.add(cmd_name.lower())
+        self._node_target_commands = commands
 
     def load_feature(self, path: str):
         """
@@ -280,11 +291,14 @@ class MeshChatApp(App):
 
         self.features.append(feature)
         feature_commands = feature.commands()
+        feature_completions = feature.completions()
         self._commands.update(feature_commands)
         self._feature_path_set.add(normalized_path)
         self._feature_paths_loaded.append(normalized_path)
         self._feature_by_path[normalized_path] = feature
         self._feature_command_map[feature] = feature_commands
+        self._feature_completion_map[feature] = feature_completions
+        self._rebuild_completion_sets()
 
         if announce_ui:
             self.ui_system_write(
@@ -342,6 +356,9 @@ class MeshChatApp(App):
             if self._commands.get(cmd_name) is handler:
                 self._commands.pop(cmd_name, None)
 
+        self._feature_completion_map.pop(feature, None)
+        self._rebuild_completion_sets()
+
         try:
             feature.shutdown()
         except Exception as e:
@@ -380,7 +397,7 @@ class MeshChatApp(App):
         yield Input(
             placeholder="Type /help for commands", 
             max_length=180,
-            suggester=NodeSuggester(self.iface, self._sendto_aliases),)
+            suggester=NodeSuggester(self.iface, self._node_target_commands),)
         
         yield Horizontal(
             Label("", id="status"),

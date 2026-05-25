@@ -66,6 +66,19 @@ class MeshFeature:
         """
         return {}
 
+    def completions(self) -> dict[str, str]:
+        """
+        Return optional completion metadata per command.
+
+        Keys are bare command words (no slash). Values are completion kinds.
+        Supported kinds:
+            "node_target"  - first argument should autocomplete to node name/id
+
+        Example:
+            {"trout": "node_target"}
+        """
+        return {}
+
     def help_text(self) -> list[str]:
         """
         Return a list of help lines to include in /help output.
