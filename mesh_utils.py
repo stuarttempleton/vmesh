@@ -2,6 +2,7 @@
 mesh_utils.py — Meshtastic utility functions (no UI dependency)
 """
 
+import re
 import time
 import shlex
 from tzlocal import get_localzone
@@ -164,3 +165,7 @@ def parse_sendto(text: str):
     raw_dest = parts[1]
     msg = " ".join(parts[2:]).strip()
     return raw_dest, msg
+
+
+def strip_markup(text: str) -> str:
+    return re.sub(r'\[/?[^\]]+\]', '', text).strip()

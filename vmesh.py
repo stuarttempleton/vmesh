@@ -26,7 +26,7 @@ import meshtastic.tcp_interface
 from pubsub import pub
 
 from textual.app import App, ComposeResult
-from textual.widgets import Label, RichLog, Input, Header, Footer
+from textual.widgets import Label, RichLog, Input, Header
 from textual.suggester import Suggester
 from textual.containers import Horizontal
 
@@ -40,26 +40,10 @@ from mesh_utils import (
     resolve_destination,
     set_timezone,
     truncate_for_mesh,
+    strip_markup,
 )
 
-
-import re
-
-def _strip_markup(text: str) -> str:
-    return re.sub(r'\[/?[^\]]+\]', '', text).strip()
-
-class ContextLog:
-    def __init__(self, max_entries: int = 50):
-        self._entries: list[str] = []
-        self.max_entries = max_entries
-
-    def append(self, text: str) -> None:
-        self._entries.append(text)
-        if len(self._entries) > self.max_entries:
-            self._entries.pop(0)
-
-    def snapshot(self) -> list[str]:
-        return list(self._entries)
+from mesh_event_bus import MeshEventBus
 
 
 @dataclass
@@ -70,97 +54,6 @@ class PendingAck:
     timestamp: datetime
     status: str = "pending"  # "ack" | "nack" | "pending"
  
-# -- Event bus ---------------------------------------------------------------
-
-class MeshEventBus:
-    """
-    Lightweight event bus shared between the app and all features.
-
-    Features subscribe to named events; the app fires them.
-    The bus also exposes run_worker and call_from_thread so features
-    never need to import from vmesh or Textual directly.
-
-    Available events:
-        on_packet(packet: dict)          — incoming text packet (Textual thread)
-        on_connect(interface)            — device ready (Textual thread)
-        on_send(destination, message)    — user sent a message (Textual thread)
-    """
-
-    EVENTS = ("on_packet", "on_connect", "on_send")
-
-    def __init__(self):
-        self._handlers: dict[str, list[Callable]] = {e: [] for e in self.EVENTS}
-        self._run_worker    = None   # injected by the app after construction
-        self._call_from_thread = None
-        self.context_log = ContextLog()
-
-    def on(self, event: str, handler: Callable) -> None:
-        if event not in self._handlers:
-            raise ValueError(f"Unknown event '{event}'. Valid events: {self.EVENTS}")
-        self._handlers[event].append(handler)
-
-    def fire(self, event: str, *args, **kwargs) -> None:
-        for handler in self._handlers.get(event, []):
-            try:
-                handler(*args, **kwargs)
-            except Exception as e:
-                # Don't let a broken feature take down the whole app
-                print(f"[feature error] {event} handler {handler}: {e}", file=sys.stderr)
-
-    def run_worker(self, fn: Callable, **kwargs) -> None:
-        """Run a callable in a background thread (via the Textual app worker)."""
-        if self._run_worker:
-            self._run_worker(fn, **kwargs)
-
-    def call_from_thread(self, fn: Callable, *args, **kwargs) -> None:
-        """Schedule a UI call from a background thread."""
-        if self._call_from_thread:
-            self._call_from_thread(fn, *args, **kwargs)
-
-# -- Feature loader ----------------------------------------------------------
-
-def load_feature(path: str, ui_write: Callable, iface, bus: MeshEventBus):
-    """
-    Dynamically load a feature from a .py file path.
-
-    The file must define exactly one MeshFeature subclass.
-    Returns the instantiated feature, or None on failure.
-    """
-    from feature_base import MeshFeature
-
-    spec   = importlib.util.spec_from_file_location("_vmesh_feature", path)
-    module = importlib.util.module_from_spec(spec)
-
-    try:
-        spec.loader.exec_module(module)
-    except Exception as e:
-        print(f"[feature] Failed to load {path}: {e}", file=sys.stderr)
-        return None
-
-    # Find the first MeshFeature subclass defined in the module
-    feature_class = None
-    for name in dir(module):
-        obj = getattr(module, name)
-        try:
-            if isinstance(obj, type) and issubclass(obj, MeshFeature) and obj is not MeshFeature:
-                feature_class = obj
-                break
-        except TypeError:
-            continue
-
-    if feature_class is None:
-        print(f"[feature] No MeshFeature subclass found in {path}", file=sys.stderr)
-        return None
-
-    try:
-        instance = feature_class(ui_write=ui_write, iface=iface, bus=bus)
-        print(f"[feature] Loaded {feature_class.__name__} from {path}")
-        return instance
-    except Exception as e:
-        print(f"[feature] Failed to instantiate {feature_class.__name__}: {e}", file=sys.stderr)
-        return None
-
-
 
 class NodeSuggester(Suggester):
     def __init__(self, iface):
@@ -185,18 +78,6 @@ class NodeSuggester(Suggester):
         return None
 
 # -- App ---------------------------------------------------------------------
-
-CORE_HELP = [
-    "Commands:",
-    "  /send MSG               - send a message to the mesh",
-    "  /sendto NODE_ID MSG     - send a message to a specific node",
-    "  /nodes                  - show nodes in the mesh",
-    "  /info                   - show info about this node",
-    "  /quit                   - exit the app",
-    "",
-    "  Tip: to copy text, use Shift+drag in a standard terminal",
-]
-
 
 class MeshChatApp(App):
     CSS = """
@@ -228,6 +109,17 @@ class MeshChatApp(App):
         text-align: right;
     }
     """
+    
+    CORE_HELP = [
+        "Commands:",
+        "  /send MSG               - send a message to the mesh",
+        "  /sendto NODE_ID MSG     - send a message to a specific node",
+        "  /nodes                  - show nodes in the mesh",
+        "  /info                   - show info about this node",
+        "  /quit                   - exit the app",
+        "",
+        "  Tip: to copy text, use Shift+drag in a standard terminal",
+    ]
 
     def __init__(self, port: str = None, host: str = None, feature_paths: list[str] = None):
         super().__init__()
@@ -248,11 +140,52 @@ class MeshChatApp(App):
         # Load features after iface exists but ui_write isn't ready yet —
         # features that call ui_write at init time will queue via call_from_thread.
         for path in (feature_paths or []):
-            feature = load_feature(path, self.ui_write, self.iface, self.bus)
+            feature = self.load_feature(path)
             if feature:
                 self.features.append(feature)
                 self._commands.update(feature.commands())
 
+    def load_feature(self, path: str):
+        """
+        Dynamically load a feature from a .py file path.
+
+        The file must define exactly one MeshFeature subclass.
+        Returns the instantiated feature, or None on failure.
+        """
+        from feature_base import MeshFeature
+
+        spec   = importlib.util.spec_from_file_location("_vmesh_feature", path)
+        module = importlib.util.module_from_spec(spec)
+
+        try:
+            spec.loader.exec_module(module)
+        except Exception as e:
+            print(f"[feature] Failed to load {path}: {e}", file=sys.stderr)
+            return None
+
+        # Find the first MeshFeature subclass defined in the module
+        feature_class = None
+        for name in dir(module):
+            obj = getattr(module, name)
+            try:
+                if isinstance(obj, type) and issubclass(obj, MeshFeature) and obj is not MeshFeature:
+                    feature_class = obj
+                    break
+            except TypeError:
+                continue
+
+        if feature_class is None:
+            print(f"[feature] No MeshFeature subclass found in {path}", file=sys.stderr)
+            return None
+
+        try:
+            instance = feature_class(ui_write=self.ui_write, iface=self.iface, bus=self.bus)
+            print(f"[feature] Loaded {feature_class.__name__} from {path}")
+            return instance
+        except Exception as e:
+            print(f"[feature] Failed to instantiate {feature_class.__name__}: {e}", file=sys.stderr)
+            return None
+        
     # -- Setup ---------------------------------------------------------------
 
     def _connect(self, port: str = None, host: str = None):
@@ -300,7 +233,7 @@ class MeshChatApp(App):
     def ui_write(self, text: str, log: bool = False) -> None:
         self.messages.write(text)
         if log:
-            self.bus.context_log.append(_strip_markup(text))
+            self.bus.context_log.append(strip_markup(text))
 
     def ui_system_write(self, text: str, log: bool = False) -> None:
         self.ui_write(f"[dim]{text}[/dim]", log=log)
@@ -312,12 +245,14 @@ class MeshChatApp(App):
         return datetime.now().strftime("[%H:%M]")
 
     def _build_help(self) -> str:
-        lines = list(CORE_HELP)
+        lines = list(self.CORE_HELP)
         for feature in self.features:
             extra = feature.help_text()
             if extra:
                 lines.append("")
+                lines.append(f"{feature.__class__.__name__} commands:")
                 lines.extend(extra)
+        lines.append("")
         return "\n".join(lines)
 
     def ui_update_status(self, interface=None) -> None:
