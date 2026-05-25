@@ -19,9 +19,21 @@ class MeshEventBus:
         on_packet(packet: dict)          — incoming text packet (Textual thread)
         on_connect(interface)            — device ready (Textual thread)
         on_send(destination, message)    — user sent a message (Textual thread)
+        on_nodeinfo(packet: dict)        — node info update packet
+        on_telemetry(packet: dict)       — telemetry packet
+        on_position(packet: dict)        — position packet
+        on_routing(packet: dict)         — routing/ack packet
     """
 
-    EVENTS = ("on_packet", "on_connect", "on_send")
+    EVENTS = (
+        "on_packet",
+        "on_connect",
+        "on_send",
+        "on_nodeinfo",
+        "on_telemetry",
+        "on_position",
+        "on_routing",
+    )
 
     def __init__(self):
         self._handlers: dict[str, list[Callable]] = {e: [] for e in self.EVENTS}
@@ -33,6 +45,20 @@ class MeshEventBus:
         if event not in self._handlers:
             raise ValueError(f"Unknown event '{event}'. Valid events: {self.EVENTS}")
         self._handlers[event].append(handler)
+
+    def remove_handlers_for_owner(self, owner: object) -> int:
+        """Remove all event handlers bound to a specific owner instance."""
+        removed = 0
+        for event in self.EVENTS:
+            handlers = self._handlers.get(event, [])
+            kept: list[Callable] = []
+            for handler in handlers:
+                if getattr(handler, "__self__", None) is owner:
+                    removed += 1
+                else:
+                    kept.append(handler)
+            self._handlers[event] = kept
+        return removed
 
     def fire(self, event: str, *args, **kwargs) -> None:
         for handler in self._handlers.get(event, []):

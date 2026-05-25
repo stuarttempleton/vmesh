@@ -3,7 +3,7 @@ feature_base.py — Base class for vmesh features / plugins.
 
 A feature is a self-contained module that can:
   - Register slash commands  (/mycommand <args>)
-  - Subscribe to app events  (on_packet, on_connect, on_send)
+    - Subscribe to app events  (on_packet, on_connect, on_send, on_nodeinfo, on_telemetry, on_position, on_routing)
   - Write output to the UI   (via the ui_write callable)
   - Send mesh messages       (via the iface reference)
 
@@ -43,6 +43,10 @@ class MeshFeature:
         on_packet(packet: dict)          — incoming text packet (Textual thread)
         on_connect(interface)            — device ready (Textual thread)
         on_send(destination, message)    — user sent a message (Textual thread)
+        on_nodeinfo(packet: dict)        — node info update packet
+        on_telemetry(packet: dict)       — telemetry packet
+        on_position(packet: dict)        — position packet
+        on_routing(packet: dict)         — routing/ack packet
     """
 
     def __init__(self, ui_write: Callable, iface, bus: "MeshEventBus"):

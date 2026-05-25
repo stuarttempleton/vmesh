@@ -15,7 +15,9 @@ Usage:
 import argparse
 from dataclasses import dataclass
 import importlib.util
+from pathlib import Path
 from platform import node
+import shlex
 import sys
 from datetime import datetime
 from typing import Callable
@@ -138,6 +140,10 @@ class MeshChatApp(App):
         self._core_specs: list[CommandSpec] = []
         self._core_commands: dict[str, CommandSpec] = {}
         self._sendto_aliases: set[str] = {"sendto"}
+        self._feature_path_set: set[str] = set()
+        self._feature_paths_loaded: list[str] = []
+        self._feature_by_path: dict[str, object] = {}
+        self._feature_command_map: dict[object, dict[str, Callable]] = {}
         self._node_cache: dict[str, dict] = {}
         self._ack_log: dict[int, PendingAck] = {}
 
@@ -151,10 +157,7 @@ class MeshChatApp(App):
         # features that call ui_write at init time will queue via call_from_thread.
         self._register_core_commands()
         for path in (feature_paths or []):
-            feature = self.load_feature(path)
-            if feature:
-                self.features.append(feature)
-                self._commands.update(feature.commands())
+            self._register_feature(path, announce_ui=False)
 
     def _register_core_commands(self) -> None:
         self._core_specs = [
@@ -187,6 +190,12 @@ class MeshChatApp(App):
                 usage="/help",
                 description="show command help",
                 handler=lambda _args: self._cmd_help(),
+            ),
+            CommandSpec(
+                aliases=("feature",),
+                usage="/feature load|unload|reload TARGET",
+                description="manage feature plugins",
+                handler=lambda args: self._cmd_feature(args),
             ),
             CommandSpec(
                 aliases=("q", "quit", "exit"),
@@ -248,6 +257,110 @@ class MeshChatApp(App):
         except Exception as e:
             print(f"[feature] Failed to instantiate {feature_class.__name__}: {e}", file=sys.stderr)
             return None
+
+    def _normalize_feature_path(self, path: str) -> str:
+        feature_path = Path(path).expanduser()
+        if not feature_path.is_absolute():
+            feature_path = Path.cwd() / feature_path
+        return str(feature_path.resolve())
+
+    def _register_feature(self, path: str, announce_ui: bool) -> bool:
+        normalized_path = self._normalize_feature_path(path)
+
+        if normalized_path in self._feature_path_set:
+            if announce_ui:
+                self.ui_system_write(f"Feature already loaded: {normalized_path}")
+            return False
+
+        feature = self.load_feature(normalized_path)
+        if not feature:
+            if announce_ui:
+                self.ui_write(f"[red]Feature load failed:[/] {normalized_path}")
+            return False
+
+        self.features.append(feature)
+        feature_commands = feature.commands()
+        self._commands.update(feature_commands)
+        self._feature_path_set.add(normalized_path)
+        self._feature_paths_loaded.append(normalized_path)
+        self._feature_by_path[normalized_path] = feature
+        self._feature_command_map[feature] = feature_commands
+
+        if announce_ui:
+            self.ui_system_write(
+                f"Loaded feature {feature.__class__.__name__} from {normalized_path}",
+                log=True,
+            )
+        return True
+
+    def _resolve_feature_target(self, target: str) -> tuple[str, object] | None:
+        if not target:
+            return None
+
+        # /feature unload 2  (1-based index from /feature list)
+        if target.isdigit():
+            idx = int(target)
+            if 1 <= idx <= len(self._feature_paths_loaded):
+                path = self._feature_paths_loaded[idx - 1]
+                feature = self._feature_by_path.get(path)
+                if feature:
+                    return path, feature
+
+        # /feature unload features/foo.py
+        normalized = self._normalize_feature_path(target)
+        feature = self._feature_by_path.get(normalized)
+        if feature:
+            return normalized, feature
+
+        # /feature unload FeatureClassName
+        matches: list[tuple[str, object]] = []
+        target_name = target.lower()
+        for path in self._feature_paths_loaded:
+            candidate = self._feature_by_path.get(path)
+            if candidate and candidate.__class__.__name__.lower() == target_name:
+                matches.append((path, candidate))
+
+        if len(matches) == 1:
+            return matches[0]
+
+        return None
+
+    def _unregister_feature(self, target: str, announce_ui: bool) -> bool:
+        resolved = self._resolve_feature_target(target)
+        if resolved is None:
+            if announce_ui:
+                self.ui_write(f"[red]Feature not found:[/] {target}")
+                self.ui_system_write("Use /feature list to see loaded features")
+            return False
+
+        path, feature = resolved
+
+        removed_handlers = self.bus.remove_handlers_for_owner(feature)
+
+        feature_commands = self._feature_command_map.pop(feature, {})
+        for cmd_name, handler in feature_commands.items():
+            if self._commands.get(cmd_name) is handler:
+                self._commands.pop(cmd_name, None)
+
+        try:
+            feature.shutdown()
+        except Exception as e:
+            self.ui_write(f"[yellow]Feature shutdown error:[/] {e}")
+
+        if feature in self.features:
+            self.features.remove(feature)
+
+        self._feature_by_path.pop(path, None)
+        self._feature_path_set.discard(path)
+        if path in self._feature_paths_loaded:
+            self._feature_paths_loaded.remove(path)
+
+        if announce_ui:
+            self.ui_system_write(
+                f"Unloaded feature {feature.__class__.__name__} from {path} (removed {removed_handlers} handler(s))",
+                log=True,
+            )
+        return True
         
     # -- Setup ---------------------------------------------------------------
 
@@ -321,12 +434,16 @@ class MeshChatApp(App):
         lines.append("")
         lines.append(self.CORE_HELP_TIP)
 
-        for feature in self.features:
-            extra = feature.help_text()
-            if extra:
-                lines.append("")
-                lines.append(f"{feature.__class__.__name__} commands:")
-                lines.extend(extra)
+        if not self.features:
+            lines.append("")
+            lines.append("No features loaded.")
+        else:
+            for feature in self.features:
+                extra = feature.help_text()
+                if extra:
+                    lines.append("")
+                    lines.append(f"{feature.__class__.__name__} commands:")
+                    lines.extend(extra)
         lines.append("")
         return "\n".join(lines)
 
@@ -479,6 +596,79 @@ class MeshChatApp(App):
         self.ui_system_write(self._build_help(), log=True)
         return True
 
+    def _cmd_feature(self, args: str) -> bool:
+        try:
+            parts = shlex.split(args)
+        except ValueError as e:
+            self.ui_write(f"[red]Parse error:[/] {e}")
+            self.ui_system_write("Usage: /feature load PATH | /feature unload TARGET | /feature reload TARGET | /feature list")
+            return False
+
+        if not parts:
+            self.ui_system_write("Usage: /feature load PATH | /feature unload TARGET | /feature reload TARGET | /feature list")
+            return False
+
+        subcmd = parts[0].lower()
+
+        if subcmd in {"help", "?"}:
+            self.ui_system_write("Usage: /feature load PATH | /feature unload TARGET | /feature reload TARGET | /feature list")
+            return True
+
+        if subcmd == "list":
+            if not self._feature_paths_loaded:
+                self.ui_system_write("No features loaded.")
+                return True
+
+            lines = ["Loaded features:"]
+            for idx, path in enumerate(self._feature_paths_loaded, start=1):
+                feature = self._feature_by_path.get(path)
+                feature_name = feature.__class__.__name__ if feature else "UnknownFeature"
+                lines.append(f"  {idx}. {feature_name} - {path}")
+            self.ui_system_write("\n".join(lines), log=True)
+            return True
+
+        if subcmd == "load":
+            if len(parts) < 2:
+                self.ui_system_write("Usage: /feature load PATH")
+                return False
+            return self._register_feature(parts[1], announce_ui=True)
+
+        if subcmd in {"unload", "disable"}:
+            if len(parts) < 2:
+                self.ui_system_write("Usage: /feature unload TARGET")
+                self.ui_system_write("TARGET can be list index, path, or feature class name")
+                return False
+            return self._unregister_feature(parts[1], announce_ui=True)
+
+        if subcmd == "reload":
+            if len(parts) < 2:
+                self.ui_system_write("Usage: /feature reload TARGET")
+                self.ui_system_write("TARGET can be list index, path, or feature class name")
+                return False
+
+            resolved = self._resolve_feature_target(parts[1])
+            if resolved is None:
+                self.ui_write(f"[red]Feature not found:[/] {parts[1]}")
+                self.ui_system_write("Use /feature list to see loaded features")
+                return False
+
+            path, _ = resolved
+            if not self._unregister_feature(parts[1], announce_ui=False):
+                self.ui_write(f"[red]Feature reload failed (unload):[/] {parts[1]}")
+                return False
+
+            if not self._register_feature(path, announce_ui=False):
+                self.ui_write(f"[red]Feature reload failed (load):[/] {path}")
+                return False
+
+            feature = self._feature_by_path.get(path)
+            feature_name = feature.__class__.__name__ if feature else "UnknownFeature"
+            self.ui_system_write(f"Reloaded feature {feature_name} from {path}", log=True)
+            return True
+
+        self.ui_system_write("Usage: /feature load PATH | /feature unload TARGET | /feature reload TARGET | /feature list")
+        return False
+
     def _cmd_quit(self) -> bool:
         self.exit()
         return True
@@ -524,11 +714,42 @@ class MeshChatApp(App):
 
 # -- Entry point -------------------------------------------------------------
 
+def discover_feature_paths(features_dir: Path) -> list[str]:
+    """Return sorted plugin paths from a features directory."""
+    if not features_dir.exists() or not features_dir.is_dir():
+        return []
+
+    paths: list[str] = []
+    for path in sorted(features_dir.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        paths.append(str(path))
+    return paths
+
+
+def merge_feature_paths(auto_paths: list[str], explicit_paths: list[str]) -> list[str]:
+    """Merge feature paths while preserving order and removing duplicates."""
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    for path in auto_paths + explicit_paths:
+        if path not in seen:
+            merged.append(path)
+            seen.add(path)
+
+    return merged
+
 def main():
     parser = argparse.ArgumentParser(description="Voltur's Meshtastic Interface")
     group  = parser.add_mutually_exclusive_group()
     group.add_argument("--port",    help="Serial port, e.g. /dev/ttyUSB0 or COM3")
     group.add_argument("--host",    help="TCP hostname/IP for network-connected device")
+    parser.add_argument(
+        "--features",
+        default="none",
+        metavar="MODE",
+        help="Feature loading mode: all or none (default)",
+    )
     parser.add_argument(
         "--feature",
         action="append",
@@ -538,10 +759,21 @@ def main():
     )
     args = parser.parse_args()
 
+    mode = str(args.features).strip().lower()
+    if mode not in {"all", "none"}:
+        parser.error("--features must be 'all' or 'none'")
+
+    features_dir = Path(__file__).resolve().parent / "features"
+    auto_paths = discover_feature_paths(features_dir) if mode == "all" else []
+    feature_paths = merge_feature_paths(auto_paths, args.feature)
+
+    if mode == "all" and auto_paths:
+        print(f"[feature] Auto-discovered {len(auto_paths)} feature(s) from {features_dir}")
+
     app = MeshChatApp(
         port=args.port,
         host=args.host,
-        feature_paths=args.feature,
+        feature_paths=feature_paths,
     )
 
     try:
