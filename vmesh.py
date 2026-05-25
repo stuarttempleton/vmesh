@@ -41,6 +41,7 @@ from mesh_utils import (
     set_timezone,
     truncate_for_mesh,
     strip_markup,
+    utf8_len,
 )
 
 from mesh_event_bus import MeshEventBus
@@ -221,11 +222,14 @@ class MeshChatApp(App):
         val = event.value
         try:
             _, msg = parse_sendto(val)
-            count = len(msg)
+            count = utf8_len(msg)
         except ValueError:
-            count = len(val) - len("/send ") if val.startswith("/send ") else 0
+            if val.startswith("/send "):
+                count = utf8_len(val[len("/send "):])
+            else:
+                count = 0
         limit = 180
-        color = "red" if count > 150 else "yellow" if count > 120 else "gray"
+        color = "red" if count > limit else "yellow" if count > 150 else "gray"
         self.query_one("#char_counter", Label).update(f"[{color}]{count}/{limit}[/{color}]")
 
     # -- UI helpers ----------------------------------------------------------
@@ -339,74 +343,125 @@ class MeshChatApp(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
-        event.input.value = ""
-
         if not text:
+            event.input.value = ""
             return
 
+        if self._dispatch_input(text):
+            event.input.value = ""
+
+    def _dispatch_input(self, text: str) -> bool:
+        if text == "/send":
+            self.ui_system_write("Usage: /send <message>")
+            return False
+
         if text.startswith("/send "):
-            self._cmd_send(text[len("/send "):])
+            return self._safe_execute(
+                lambda: self._cmd_send(text[len("/send "):]),
+                "send",
+            )
+
+        if text == "/sendto":
+            self.ui_system_write('Usage: /sendto "<node name or id>" <message>')
+            return False
 
         elif text.startswith("/sendto "):
-            self._cmd_sendto(text)
+            return self._safe_execute(lambda: self._cmd_sendto(text), "sendto")
 
         elif text in ("/nodes", "/nodelist"):
             self.ui_system_write(format_nodes(self.iface), log=True)
+            return True
 
         elif text in ("/info", "/nodeinfo", "/nodeInfo"):
             self.ui_system_write(format_node_info(self.iface), log=True)
+            return True
 
         elif text in ("/help", "/h"):
             self.ui_system_write(self._build_help(), log=True)
+            return True
 
         elif text in ("/q", "/quit", "/exit"):
             self.exit()
+            return True
 
         elif text.startswith("/"):
             # Dispatch to feature commands
             cmd, _, args = text[1:].partition(" ")
             if cmd in self._commands:
-                self._commands[cmd](args)
+                return self._safe_execute(lambda: self._commands[cmd](args), f"/{cmd}")
             else:
                 self.ui_write(f"[red]Unknown command:[/] /{cmd}")
+                return False
         
         else:
             self.ui_system_write(f"Unknown command: {text}", log=True)
             self.ui_system_write(self._build_help(), log=True)
+            return False
 
-    def _cmd_send(self, msg: str) -> None:
+    def _safe_execute(self, fn: Callable[[], bool | None], command_name: str) -> bool:
+        """Execute a command handler and surface errors without crashing input handling."""
+        try:
+            result = fn()
+            if isinstance(result, bool):
+                return result
+            return True
+        except Exception as e:
+            self.ui_write(f"[red]Command error in {command_name}:[/] {e}")
+            return False
+
+    def _cmd_send(self, msg: str) -> bool:
+        if not msg.strip():
+            self.ui_system_write("Usage: /send <message>")
+            return False
+
         msg = truncate_for_mesh(msg)
-        self.iface.sendText(msg, destinationId=BROADCAST_ADDR, wantAck=False)
+        try:
+            self.iface.sendText(msg, destinationId=BROADCAST_ADDR, wantAck=False)
+        except Exception as e:
+            self.ui_write(f"[red]Send failed:[/] {e}")
+            return False
+
         self.ui_write(f"[bold cyan]You:[/] {msg}", log=True)
         self.bus.fire("on_send", BROADCAST_ADDR, msg)
+        return True
 
-    def _cmd_sendto(self, text: str) -> None:
+    def _cmd_sendto(self, text: str) -> bool:
         try:
             raw_dest, msg = parse_sendto(text)
+            if not msg.strip():
+                self.ui_system_write('Usage: /sendto "<node name or id>" <message>')
+                return False
+
             msg  = truncate_for_mesh(msg)
             dest = resolve_destination(raw_dest, self.iface)
 
             sent_packet = self.iface.sendText(msg, destinationId=dest, wantAck=True)
-            packet_id = sent_packet.id
+            packet_id = getattr(sent_packet, "id", None)
 
-            self._ack_log[packet_id] = PendingAck(
-                packet_id=packet_id,
-                destination=raw_dest,
-                message=msg,
-                timestamp=datetime.now()
-            )
+            if packet_id is not None:
+                self._ack_log[packet_id] = PendingAck(
+                    packet_id=packet_id,
+                    destination=raw_dest,
+                    message=msg,
+                    timestamp=datetime.now()
+                )
+                self.ui_write(
+                    f"[bold green][SENT -> {raw_dest} id={packet_id}][/bold green] {msg}", log=True
+                )
+            else:
+                self.ui_write(f"[bold green][SENT -> {raw_dest}][/bold green] {msg}", log=True)
 
-            self.ui_write(
-                f"[bold green][SENT -> {raw_dest} id={packet_id}][/bold green] {msg}", log=True
-            )
             self.bus.fire("on_send", dest, msg)
+            return True
 
         except ValueError as e:
             self.ui_write(f"[red]{e}[/red]")
             self.ui_system_write('Usage: /sendto "<node name or id>" <message>')
+            return False
 
         except Exception as e:
-            self.ui_write(f"[red]Parse error:[/] {e}")
+            self.ui_write(f"[red]Send failed:[/] {e}")
+            return False
 
 
 # -- Entry point -------------------------------------------------------------

@@ -154,6 +154,11 @@ def truncate_for_mesh(text: str, max_bytes: int = MAX_MESSAGE_LEN) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def utf8_len(text: str) -> int:
+    """Return the UTF-8 byte length of text."""
+    return len(text.encode("utf-8"))
+
+
 def parse_sendto(text: str):
     """
     Parse a /sendto command string.
