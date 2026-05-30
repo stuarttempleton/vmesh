@@ -23,8 +23,8 @@ from feature_base import MeshFeature
 
 
 class MeshPulseFeature(MeshFeature):
-    def __init__(self, ui_write: Callable, iface, bus):
-        super().__init__(ui_write, iface, bus)
+    def __init__(self, ui_write: Callable, iface, bus, cli_args=None):
+        super().__init__(ui_write, iface, bus, cli_args)
 
         self._lock = Lock()
         self._started_at = datetime.now()
@@ -41,11 +41,24 @@ class MeshPulseFeature(MeshFeature):
         self._recent_outbound: deque[datetime] = deque(maxlen=2048)
         self._watch_enabled = False
         self._watch_last_emit: datetime | None = None
-        self._watch_min_interval = timedelta(seconds=60)
+        
+        # Use parsed args if available, otherwise default to 60 seconds
+        watch_interval = self.args.pulse_watch_interval if self.args else 60
+        self._watch_min_interval = timedelta(seconds=watch_interval)
 
         bus.on("on_connect", self._on_connect)
         bus.on("on_packet", self._on_packet)
         bus.on("on_send", self._on_send)
+
+    def add_arguments(self, parser):
+        """Add MeshPulse-specific CLI arguments."""
+        parser.add_argument(
+            '--pulse-watch-interval',
+            type=int,
+            default=60,
+            help='Interval in seconds for pulse watch heartbeat (default: 60)'
+        )
+        return parser
 
     def commands(self) -> dict[str, Callable]:
         return {

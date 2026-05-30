@@ -130,19 +130,21 @@ class MeshChatApp(App):
     
     CORE_HELP_TIP = "  Tip: to copy text, use Shift+drag in a standard terminal"
 
-    def __init__(self, port: str = None, host: str = None, feature_paths: list[str] = None):
+    def __init__(self, port: str = None, host: str = None, feature_paths: list[str] = None, cli_args: list[str] = None):
         super().__init__()
         self.title = "Voltur's Meshtastic Interface"
-
+        self.cli_args = cli_args or [] # Store CLI args for features to access if needed
         self.bus      = MeshEventBus()
-        self.features: list = []
-        self._commands: dict[str, Callable] = {}
+
         self._core_specs: list[CommandSpec] = []
         self._core_commands: dict[str, CommandSpec] = {}
+        self._commands: dict[str, Callable[[str], None]] = {}
         self._sendto_aliases: set[str] = {"sendto"}
         self._node_target_commands: set[str] = {"sendto"}
         self._feature_path_set: set[str] = set()
         self._feature_paths_loaded: list[str] = []
+        self._feature_instances: list[object] = []
+        self._feature_cli_args_by_path: dict[str, list[str]] = {}
         self._feature_by_path: dict[str, object] = {}
         self._feature_command_map: dict[object, dict[str, Callable]] = {}
         self._feature_completion_map: dict[object, dict[str, str]] = {}
@@ -195,7 +197,7 @@ class MeshChatApp(App):
             ),
             CommandSpec(
                 aliases=("feature",),
-                usage="/feature load|unload|reload TARGET",
+                usage="/feature load PATH [ARGS...] | reload TARGET [ARGS...]",
                 description="manage feature plugins",
                 handler=lambda args: self._cmd_feature(args),
             ),
@@ -228,7 +230,7 @@ class MeshChatApp(App):
                     commands.add(cmd_name.lower())
         self._node_target_commands = commands
 
-    def load_feature(self, path: str):
+    def load_feature(self, path: str, cli_args: list[str] | None = None):
         """
         Dynamically load a feature from a .py file path.
 
@@ -262,7 +264,12 @@ class MeshChatApp(App):
             return None
 
         try:
-            instance = feature_class(ui_write=self.ui_write, iface=self.iface, bus=self.bus)
+            instance = feature_class(
+                ui_write=self.ui_write,
+                iface=self.iface,
+                bus=self.bus,
+                cli_args=cli_args if cli_args is not None else self.cli_args,
+            )
             print(f"[feature] Loaded {feature_class.__name__} from {path}")
             return instance
         except Exception as e:
@@ -275,7 +282,7 @@ class MeshChatApp(App):
             feature_path = Path.cwd() / feature_path
         return str(feature_path.resolve())
 
-    def _register_feature(self, path: str, announce_ui: bool) -> bool:
+    def _register_feature(self, path: str, announce_ui: bool, feature_cli_args: list[str] | None = None) -> bool:
         normalized_path = self._normalize_feature_path(path)
 
         if normalized_path in self._feature_path_set:
@@ -283,19 +290,22 @@ class MeshChatApp(App):
                 self.ui_system_write(f"Feature already loaded: {normalized_path}")
             return False
 
-        feature = self.load_feature(normalized_path)
+        effective_cli_args = feature_cli_args if feature_cli_args is not None else self.cli_args
+
+        feature = self.load_feature(normalized_path, cli_args=effective_cli_args)
         if not feature:
             if announce_ui:
                 self.ui_write(f"[red]Feature load failed:[/] {normalized_path}")
             return False
 
-        self.features.append(feature)
+        self._feature_instances.append(feature)
         feature_commands = feature.commands()
         feature_completions = feature.completions()
         self._commands.update(feature_commands)
         self._feature_path_set.add(normalized_path)
         self._feature_paths_loaded.append(normalized_path)
         self._feature_by_path[normalized_path] = feature
+        self._feature_cli_args_by_path[normalized_path] = list(effective_cli_args)
         self._feature_command_map[feature] = feature_commands
         self._feature_completion_map[feature] = feature_completions
         self._rebuild_completion_sets()
@@ -364,10 +374,11 @@ class MeshChatApp(App):
         except Exception as e:
             self.ui_write(f"[yellow]Feature shutdown error:[/] {e}")
 
-        if feature in self.features:
-            self.features.remove(feature)
+        if feature in self._feature_instances:
+            self._feature_instances.remove(feature)
 
         self._feature_by_path.pop(path, None)
+        self._feature_cli_args_by_path.pop(path, None)
         self._feature_path_set.discard(path)
         if path in self._feature_paths_loaded:
             self._feature_paths_loaded.remove(path)
@@ -451,11 +462,11 @@ class MeshChatApp(App):
         lines.append("")
         lines.append(self.CORE_HELP_TIP)
 
-        if not self.features:
+        if not self._feature_instances:
             lines.append("")
             lines.append("No features loaded.")
         else:
-            for feature in self.features:
+            for feature in self._feature_instances:
                 extra = feature.help_text()
                 if extra:
                     lines.append("")
@@ -618,17 +629,17 @@ class MeshChatApp(App):
             parts = shlex.split(args)
         except ValueError as e:
             self.ui_write(f"[red]Parse error:[/] {e}")
-            self.ui_system_write("Usage: /feature load PATH | /feature unload TARGET | /feature reload TARGET | /feature list")
+            self.ui_system_write("Usage: /feature load PATH [ARGS...] | /feature unload TARGET | /feature reload TARGET [ARGS...] | /feature list")
             return False
 
         if not parts:
-            self.ui_system_write("Usage: /feature load PATH | /feature unload TARGET | /feature reload TARGET | /feature list")
+            self.ui_system_write("Usage: /feature load PATH [ARGS...] | /feature unload TARGET | /feature reload TARGET [ARGS...] | /feature list")
             return False
 
         subcmd = parts[0].lower()
 
         if subcmd in {"help", "?"}:
-            self.ui_system_write("Usage: /feature load PATH | /feature unload TARGET | /feature reload TARGET | /feature list")
+            self.ui_system_write("Usage: /feature load PATH [ARGS...] | /feature unload TARGET | /feature reload TARGET [ARGS...] | /feature list")
             return True
 
         if subcmd == "list":
@@ -640,15 +651,21 @@ class MeshChatApp(App):
             for idx, path in enumerate(self._feature_paths_loaded, start=1):
                 feature = self._feature_by_path.get(path)
                 feature_name = feature.__class__.__name__ if feature else "UnknownFeature"
-                lines.append(f"  {idx}. {feature_name} - {path}")
+                arg_str = " ".join(shlex.quote(arg) for arg in self._feature_cli_args_by_path.get(path, []))
+                if arg_str:
+                    lines.append(f"  {idx}. {feature_name} - {path} [args: {arg_str}]")
+                else:
+                    lines.append(f"  {idx}. {feature_name} - {path}")
             self.ui_system_write("\n".join(lines), log=True)
             return True
 
         if subcmd == "load":
             if len(parts) < 2:
-                self.ui_system_write("Usage: /feature load PATH")
+                self.ui_system_write("Usage: /feature load PATH [ARGS...]")
                 return False
-            return self._register_feature(parts[1], announce_ui=True)
+            feature_path = parts[1]
+            passthrough_args = self.cli_args + parts[2:]
+            return self._register_feature(feature_path, announce_ui=True, feature_cli_args=passthrough_args)
 
         if subcmd in {"unload", "disable"}:
             if len(parts) < 2:
@@ -659,7 +676,7 @@ class MeshChatApp(App):
 
         if subcmd == "reload":
             if len(parts) < 2:
-                self.ui_system_write("Usage: /feature reload TARGET")
+                self.ui_system_write("Usage: /feature reload TARGET [ARGS...]")
                 self.ui_system_write("TARGET can be list index, path, or feature class name")
                 return False
 
@@ -670,11 +687,12 @@ class MeshChatApp(App):
                 return False
 
             path, _ = resolved
+            passthrough_args = self.cli_args + parts[2:] if len(parts) > 2 else self._feature_cli_args_by_path.get(path, self.cli_args)
             if not self._unregister_feature(parts[1], announce_ui=False):
                 self.ui_write(f"[red]Feature reload failed (unload):[/] {parts[1]}")
                 return False
 
-            if not self._register_feature(path, announce_ui=False):
+            if not self._register_feature(path, announce_ui=False, feature_cli_args=passthrough_args):
                 self.ui_write(f"[red]Feature reload failed (load):[/] {path}")
                 return False
 
@@ -683,7 +701,7 @@ class MeshChatApp(App):
             self.ui_system_write(f"Reloaded feature {feature_name} from {path}", log=True)
             return True
 
-        self.ui_system_write("Usage: /feature load PATH | /feature unload TARGET | /feature reload TARGET | /feature list")
+        self.ui_system_write("Usage: /feature load PATH [ARGS...] | /feature unload TARGET | /feature reload TARGET [ARGS...] | /feature list")
         return False
 
     def _cmd_quit(self) -> bool:
@@ -774,7 +792,7 @@ def main():
         metavar="PATH",
         help="Path to a feature plugin file (can be repeated)",
     )
-    args = parser.parse_args()
+    args, _unknown_args = parser.parse_known_args()
 
     mode = str(args.features).strip().lower()
     if mode not in {"all", "none"}:
@@ -791,13 +809,14 @@ def main():
         port=args.port,
         host=args.host,
         feature_paths=feature_paths,
+        cli_args=sys.argv[1:],
     )
 
     try:
         app.run()
     finally:
         app.iface.close()
-        for feature in app.features:
+        for feature in app._feature_instances:
             feature.shutdown()
 
 

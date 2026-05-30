@@ -23,8 +23,8 @@ from feature_base import MeshFeature
 
 
 class RelayWatchFeature(MeshFeature):
-    def __init__(self, ui_write: Callable, iface, bus):
-        super().__init__(ui_write, iface, bus)
+    def __init__(self, ui_write: Callable, iface, bus, cli_args=None):
+        super().__init__(ui_write, iface, bus, cli_args)
 
         self._lock = Lock()
         self._total = 0

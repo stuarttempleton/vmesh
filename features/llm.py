@@ -93,11 +93,11 @@ class LLMFeature(MeshFeature):
         base_url (str) : LLM API base URL,  default http://localhost:11434
     """
 
-    def __init__(self, ui_write: Callable, iface, bus, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL):
-        super().__init__(ui_write, iface, bus)
+    def __init__(self, ui_write: Callable, iface, bus, cli_args=None, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL):
+        super().__init__(ui_write, iface, bus, cli_args)
 
-        self.model      = model
-        self.base_url   = base_url
+        #self.model      = model
+        #self.base_url   = base_url
         self.auto_reply = False
 
         self._node_convos: dict[str, object] = {}  # node_id -> LLMConversation
@@ -111,8 +111,8 @@ class LLMFeature(MeshFeature):
             return
 
         self._local_convo = LLMConversation(
-            base_url=self.base_url,
-            model=self.model,
+            base_url=self.args.llm_base_url if self.args else DEFAULT_BASE_URL,
+            model=self.args.llm_model if self.args else DEFAULT_MODEL,
             system_prompt=_LOCAL_PROMPT,
         )
         self._local_convo.client.temperature = 0
@@ -122,6 +122,20 @@ class LLMFeature(MeshFeature):
         bus.on("on_connect", self._on_connect)
 
     # -- MeshFeature interface -----------------------------------------------
+
+    def add_arguments(self, parser):
+        """Add LLMFeature-specific CLI arguments."""
+        parser.add_argument(
+            '--llm-model',
+            default=DEFAULT_MODEL,
+            help=f"LLM model name (default: {DEFAULT_MODEL})"
+        )
+        parser.add_argument(
+            '--llm-base-url',
+            default=DEFAULT_BASE_URL,
+            help=f"LLM API base URL (default: {DEFAULT_BASE_URL})"
+        )
+        return parser
 
     def commands(self) -> dict[str, Callable]:
         return {
@@ -179,7 +193,7 @@ class LLMFeature(MeshFeature):
     def _on_connect(self, interface) -> None:
         if LLM_AVAILABLE:
             self.ui_write(
-                f"[green][LLM][/green] Ready — model: {self.model} @ {self.base_url}"
+                f"[green][LLM][/green] Ready — model: {self.args.llm_model if self.args else DEFAULT_MODEL} @ {self.args.llm_base_url if self.args else DEFAULT_BASE_URL}"
             )
 
     def _on_packet(self, packet: dict) -> None:
@@ -240,8 +254,8 @@ class LLMFeature(MeshFeature):
     def _get_node_convo(self, node_id: str):
         if node_id not in self._node_convos:
             self._node_convos[node_id] = LLMConversation(
-                base_url=self.base_url,
-                model=self.model,
+                base_url=self.args.llm_base_url if self.args else DEFAULT_BASE_URL,
+                model=self.args.llm_model if self.args else DEFAULT_MODEL,
                 system_prompt=_PACKET_PROMPT,
             )
         return self._node_convos[node_id]

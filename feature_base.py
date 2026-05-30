@@ -23,6 +23,7 @@ Example:
 """
 
 from __future__ import annotations
+import argparse
 from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -49,10 +50,45 @@ class MeshFeature:
         on_routing(packet: dict)         — routing/ack packet
     """
 
-    def __init__(self, ui_write: Callable, iface, bus: "MeshEventBus"):
+    def __init__(self, ui_write: Callable, iface, bus: "MeshEventBus", cli_args: list[str] | None = None):
         self.ui_write = ui_write
         self.iface    = iface
         self.bus      = bus
+        self.cli_args = cli_args or []
+        self.args     = None  # Store parsed args for easy access
+        
+        # Parse args if this feature defines a parser
+        if cli_args is not None:
+            self._parse_feature_args()
+
+    def _parse_feature_args(self) -> None:
+        """
+        Orchestrate arg parsing: build a parser, let subclass add args, then parse.
+        Stores result in self.args for easy access.
+        Silently skips parsing if add_arguments() returns None.
+        """
+        parser = self.add_arguments(argparse.ArgumentParser(add_help=False))
+        if parser:
+            try:
+                self.args = parser.parse_known_args(self.cli_args)[0]
+            except SystemExit:
+                # argparse calls sys.exit on error; convert to runtime error
+                self.args = None
+
+    def add_arguments(self, parser: argparse.ArgumentParser) -> argparse.ArgumentParser | None:
+        """
+        Override to add feature-specific arguments to the parser.
+        Return the parser, or None if no args needed.
+        
+        Use parse_known_args() so your parser only consumes its own flags
+        and ignores flags from other features.
+        
+        Example:
+            parser.add_argument('--llm-model', default='gpt-4')
+            parser.add_argument('--llm-temp', type=float, default=0.7)
+            return parser
+        """
+        return None
 
     def commands(self) -> dict[str, Callable[[str], None]]:
         """
