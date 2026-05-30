@@ -499,9 +499,9 @@ class MeshChatApp(App):
             self.call_from_thread(self._handle_incoming, packet)
 
         elif portnum == "NODEINFO_APP":
-            self.call_from_thread(self._handle_node_updated, 
-                                  packet["fromId"], 
-                                  packet.get("decoded", {}).get("user", {}))
+            user = packet.get("decoded", {}).get("user", {})
+            node_key = self._node_cache_key(packet, user)
+            self.call_from_thread(self._handle_node_updated, node_key, user)
             self.bus.fire("on_nodeinfo", packet)
 
         elif portnum == "TELEMETRY_APP":
@@ -528,6 +528,14 @@ class MeshChatApp(App):
 
         self.ui_write(f"[dim]{ts}[/dim] [bold magenta]{label}:[/] {msg}", log=True)
         self.bus.fire("on_packet", packet)
+
+    def _node_cache_key(self, packet: dict, user: dict) -> str:
+        """Return stable identity for NODEINFO cache and rename detection."""
+        for key in ("id", "nodeId", "num"):
+            value = user.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return str(packet.get("fromId", "unknown"))
 
 
     def _handle_node_updated(self, node_id: str, user: dict) -> None:
